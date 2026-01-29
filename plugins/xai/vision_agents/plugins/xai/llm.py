@@ -1,24 +1,25 @@
 import json
-from typing import Optional, List, Any, TYPE_CHECKING, Dict
-from xai_sdk import AsyncClient
-from xai_sdk.chat import system, user, Response, Chunk, tool_result, tool
-from xai_sdk.proto import chat_pb2
+import time
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from vision_agents.core.llm.llm import LLM, LLMResponseEvent
-from vision_agents.core.processors import Processor
+from getstream.video.rtc.pb.stream.video.sfu.models.models_pb2 import Participant
 from vision_agents.core.llm.events import (
+    LLMRequestStartedEvent,
     LLMResponseChunkEvent,
     LLMResponseCompletedEvent,
 )
+from vision_agents.core.llm.llm import LLM, LLMResponseEvent
 from vision_agents.core.llm.llm_types import NormalizedToolCallItem, ToolSchema
+from vision_agents.core.processors import Processor
+from xai_sdk import AsyncClient
+from xai_sdk.chat import Chunk, Response, system, tool, tool_result, user
+from xai_sdk.proto import chat_pb2
+
 from . import events
 
 if TYPE_CHECKING:
     from vision_agents.core.agents.conversation import Message
-    from getstream.video.rtc.pb.stream.video.sfu.models.models_pb2 import Participant
     from xai_sdk.aio.chat import Chat
-else:
-    from getstream.video.rtc.pb.stream.video.sfu.models.models_pb2 import Participant
 
 
 class XAILLM(LLM):
@@ -125,6 +126,19 @@ class XAILLM(LLM):
         assert self.xai_chat is not None
         self.xai_chat.append(user(input_text))
 
+        # Emit request started event
+        self.events.send(
+            LLMRequestStartedEvent(
+                plugin_name="xai",
+                model=model,
+                streaming=stream,
+            )
+        )
+
+        # Track timing
+        request_start_time = time.perf_counter()
+        first_token_time: Optional[float] = None
+
         # Get response based on streaming preference
         if stream:
             # Handle streaming response
@@ -133,8 +147,18 @@ class XAILLM(LLM):
             seen = set()
             assert self.xai_chat is not None
             async for response, chunk in self.xai_chat.stream():
+                # Track time to first token
+                is_first_chunk = False
+                if first_token_time is None and chunk.content:
+                    first_token_time = time.perf_counter()
+                    is_first_chunk = True
+
                 llm_response_optional = self._standardize_and_emit_chunk(
-                    chunk, response
+                    chunk,
+                    response,
+                    request_start_time=request_start_time,
+                    first_token_time=first_token_time,
+                    is_first_chunk=is_first_chunk,
                 )
                 if llm_response_optional is not None:
                     llm_response = llm_response_optional
@@ -176,9 +200,20 @@ class XAILLM(LLM):
                 llm_response = await self._handle_tool_calls(tool_calls, kwargs)
 
         if llm_response is not None:
+            # Calculate timing metrics
+            latency_ms = (time.perf_counter() - request_start_time) * 1000
+            ttft_ms: Optional[float] = None
+            if first_token_time is not None:
+                ttft_ms = (first_token_time - request_start_time) * 1000
+
             self.events.send(
                 LLMResponseCompletedEvent(
-                    original=llm_response.original, text=llm_response.text
+                    original=llm_response.original,
+                    text=llm_response.text,
+                    plugin_name="xai",
+                    latency_ms=latency_ms,
+                    time_to_first_token_ms=ttft_ms,
+                    model=model,
                 )
             )
 
@@ -400,7 +435,12 @@ class XAILLM(LLM):
         )
 
     def _standardize_and_emit_chunk(
-        self, chunk: Chunk, response: Response
+        self,
+        chunk: Chunk,
+        response: Response,
+        request_start_time: Optional[float] = None,
+        first_token_time: Optional[float] = None,
+        is_first_chunk: bool = False,
     ) -> Optional[LLMResponseEvent[Response]]:
         """
         Forwards the chunk events and also send out a standardized version (the agent class hooks into that)
@@ -410,6 +450,15 @@ class XAILLM(LLM):
 
         # Emit standardized delta events for content
         if chunk.content:
+            # Calculate time to first token only for first chunk
+            ttft_ms: Optional[float] = None
+            if (
+                is_first_chunk
+                and first_token_time is not None
+                and request_start_time is not None
+            ):
+                ttft_ms = (first_token_time - request_start_time) * 1000
+
             self.events.send(
                 LLMResponseChunkEvent(
                     content_index=0,  # xAI doesn't have content_index
@@ -418,6 +467,8 @@ class XAILLM(LLM):
                     sequence_number=0,  # xAI doesn't have sequence_number
                     delta=chunk.content,
                     plugin_name="xai",
+                    is_first_chunk=is_first_chunk,
+                    time_to_first_token_ms=ttft_ms,
                 )
             )
 
@@ -425,13 +476,7 @@ class XAILLM(LLM):
         if chunk.choices and chunk.choices[0].finish_reason:
             # This is the final chunk, return the complete response
             llm_response = LLMResponseEvent[Response](response, response.content)
-            self.events.send(
-                LLMResponseCompletedEvent(
-                    plugin_name="xai",
-                    text=llm_response.text,
-                    original=llm_response.original,
-                )
-            )
+            # Note: LLMResponseCompletedEvent is emitted by the caller with timing metrics
             return llm_response
 
         return None

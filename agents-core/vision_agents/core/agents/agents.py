@@ -49,6 +49,8 @@ from ..llm.events import (
 from ..llm.llm import LLM, AudioLLM, VideoLLM
 from ..llm.realtime import Realtime
 from ..mcp import MCPBaseServer, MCPManager
+from ..observability import MetricsCollector
+from ..observability.agent import AgentMetrics
 from ..processors.base_processor import (
     AudioProcessor,
     AudioPublisher,
@@ -147,6 +149,7 @@ class Agent:
         if not self.agent_user.id:
             self.agent_user.id = f"agent-{uuid4()}"
 
+        self._id = str(uuid4())
         self._pending_turn: Optional[LLMTurn] = None
         self.call: Optional[Call] = None
 
@@ -252,6 +255,12 @@ class Agent:
         self._join_lock = asyncio.Lock()
         self._close_lock = asyncio.Lock()
         self._closed = False
+        self._metrics = AgentMetrics()
+        self._collector = MetricsCollector(self)
+
+    @property
+    def id(self) -> str:
+        return self._id
 
     async def _finish_llm_turn(self):
         if self._pending_turn is None or self._pending_turn.response is None:
@@ -437,7 +446,8 @@ class Agent:
 
         @self.llm.events.subscribe
         async def on_llm_response_sync_conversation(event: LLMResponseCompletedEvent):
-            self.logger.info(f"🤖 [LLM response]: {event.text}")
+            if event.text:
+                self.logger.info(f"🤖 [LLM response]: {event.text}")
 
             if self.conversation is None:
                 return
@@ -582,6 +592,17 @@ class Agent:
             self._call_ended_event = asyncio.Event()
             self._joined_at = time.time()
             yield
+        except Exception as exc:
+            if self._closing or self._closed:
+                # Only log exceptions if the agent is already closing
+                # (e.g., when the call ended before the agent fully joined).
+                logger.warning(
+                    f"Failed to join the call because the agent is closing or already closed: {exc}"
+                )
+                # Yield to let the context manager proceed
+                yield
+            else:
+                raise
         finally:
             await self.close()
             self._end_tracing()
@@ -630,6 +651,18 @@ class Agent:
         # joining the call.
         idle_since_adjusted = max(idle_since, self._joined_at)
         return time.time() - idle_since_adjusted
+
+    def on_call_for(self) -> float:
+        """
+        Return the number of seconds for how long the agent has been on the call.
+        Returns 0.0 if the agent has not joined a call yet.
+
+        Returns:
+            Duration in seconds since the agent joined the call, or 0.0 if not on a call.
+        """
+        if not self._joined_at:
+            return 0.0
+        return time.time() - self._joined_at
 
     async def finish(self):
         """
@@ -766,8 +799,13 @@ class Agent:
         self._call_ended_event = None
         self._joined_at = 0.0
         self.clear_call_logging_context()
+        self.events.stop()
         self._closed = True
         self.logger.info("🤖 Agent stopped")
+
+    @property
+    def _closing(self):
+        return self._close_lock.locked()
 
     # ------------------------------------------------------------------
     # Logging context helpers
@@ -1012,6 +1050,11 @@ class Agent:
             t for t in self._active_video_tracks.values() if not t.processor
         ]
         if not non_processed_tracks:
+            # No active video tracks left, stop sending video to the LLM and processors
+            if _is_video_llm(self.llm):
+                await self.llm.stop_watching_video_track()
+            for processor in self.video_processors:
+                await processor.stop_processing()
             return
         source_track = sorted(
             non_processed_tracks, key=lambda t: t.priority, reverse=True
@@ -1369,6 +1412,10 @@ class Agent:
         return await asyncio.to_thread(
             lambda p: VideoFileTrack(p), self._video_track_override_path
         )
+
+    @property
+    def metrics(self) -> AgentMetrics:
+        return self._metrics
 
 
 def _is_audio_llm(llm: LLM | VideoLLM | AudioLLM) -> TypeGuard[AudioLLM]:

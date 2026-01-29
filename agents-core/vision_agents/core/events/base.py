@@ -1,12 +1,12 @@
-import uuid
 import dataclasses
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional
 from types import FunctionType
-from dataclasses_json import DataClassJsonMixin
+from typing import Any, Optional
 
+from dataclasses_json import DataClassJsonMixin
 from getstream.video.rtc.pb.stream.video.sfu.models.models_pb2 import Participant
 
 
@@ -54,45 +54,6 @@ class PluginBaseEvent(BaseEvent):
     plugin_version: str | None = None
 
 
-@dataclass
-class PluginInitializedEvent(PluginBaseEvent):
-    """Event emitted when a plugin is successfully initialized."""
-
-    type: str = field(default="plugin.initialized", init=False)
-    plugin_type: Optional[str] = None
-    provider: Optional[str] = None
-    configuration: Optional[Dict[str, Any]] = None
-    capabilities: Optional[List[str]] = None
-
-
-@dataclass
-class PluginClosedEvent(PluginBaseEvent):
-    """Event emitted when a plugin is closed."""
-
-    type: str = field(default="plugin.closed", init=False)
-    plugin_type: Optional[str] = None  # "STT", "STS", "VAD"
-    provider: Optional[str] = None
-    reason: Optional[str] = None
-    cleanup_successful: bool = True
-
-
-@dataclass
-class PluginErrorEvent(PluginBaseEvent):
-    """Event emitted when a generic plugin error occurs."""
-
-    type: str = field(default="plugin.error", init=False)
-    plugin_type: Optional[str] = None  # "STT", "TTS", "STS", "VAD"
-    provider: Optional[str] = None
-    error: Optional[Exception] = None
-    error_code: Optional[str] = None
-    context: Optional[str] = None
-    is_fatal: bool = False
-
-    @property
-    def error_message(self) -> str:
-        return str(self.error) if self.error else "Unknown error"
-
-
 @dataclasses.dataclass
 class ExceptionEvent:
     exc: Exception
@@ -100,40 +61,18 @@ class ExceptionEvent:
     type: str = "base.exception"
 
 
-@dataclasses.dataclass
-class HealthCheckEvent(DataClassJsonMixin):
-    connection_id: str
-    created_at: int
-    custom: dict
-    type: str = "health.check"
-
-
 @dataclass
-class ConnectionOkEvent(BaseEvent):
-    """Event emitted when WebSocket connection is established."""
+class VideoProcessorDetectionEvent(PluginBaseEvent):
+    """Base event for video processor detection results.
 
-    type: str = field(default="connection.ok", init=False)
-    connection_id: Optional[str] = None
-    server_time: Optional[str] = None
-    api_key: Optional[str] = None
-    user_id: Optional[str] = None  # type: ignore[assignment]
+    Video processor plugins (roboflow, ultralytics, etc.) should inherit from
+    this to enable metrics collection.
+    """
 
-
-@dataclass
-class ConnectionErrorEvent(BaseEvent):
-    """Event emitted when WebSocket connection encounters an error."""
-
-    type: str = field(default="connection.error", init=False)
-    error_code: Optional[str] = None
-    error_message: Optional[str] = None
-    reconnect_attempt: Optional[int] = None
-
-
-@dataclass
-class ConnectionClosedEvent(BaseEvent):
-    """Event emitted when WebSocket connection is closed."""
-
-    type: str = field(default="connection.closed", init=False)
-    code: Optional[int] = None
-    reason: Optional[str] = None
-    was_clean: bool = False
+    type: str = field(default="plugin.video_processor.detection", init=False)
+    model_id: Optional[str] = None
+    """Identifier of the model used for detection."""
+    inference_time_ms: Optional[float] = None
+    """Time taken for inference in milliseconds."""
+    detection_count: int = 0
+    """Number of objects/items detected."""

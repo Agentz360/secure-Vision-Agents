@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from typing import Literal, Optional, Type, cast
@@ -194,10 +195,16 @@ class RoboflowLocalDetectionProcessor(VideoProcessorPublisher, Warmable[RFDETR])
         """Return the video track for publishing processed frames."""
         return self._video_track
 
-    async def close(self):
-        """Clean up resources."""
+    async def stop_processing(self) -> None:
+        """Stop processing video when participant leaves."""
         if self._video_forwarder is not None:
             await self._video_forwarder.remove_frame_handler(self._process_frame)
+            self._video_forwarder = None
+            logger.info("🛑 Stopped Roboflow Local video processing (participant left)")
+
+    async def close(self):
+        """Clean up resources."""
+        await self.stop_processing()
         self._closed = True
         self._executor.shutdown(wait=False)
         self._video_track.stop()
@@ -253,6 +260,7 @@ class RoboflowLocalDetectionProcessor(VideoProcessorPublisher, Warmable[RFDETR])
             raise RuntimeError("The Roboflow model is not loaded")
 
         image = frame.to_ndarray(format="rgb24")
+        start_time = time.perf_counter()
         try:
             # Run inference
             detections = await self._run_inference(image)
@@ -261,6 +269,8 @@ class RoboflowLocalDetectionProcessor(VideoProcessorPublisher, Warmable[RFDETR])
             # Pass through original frame on error
             await self._video_track.add_frame(frame)
             return None
+
+        inference_time_ms = (time.perf_counter() - start_time) * 1000
 
         if detections.class_id is None or not detections.class_id.size:
             # The inference wasn't able to complete or nothing was detected
@@ -302,10 +312,13 @@ class RoboflowLocalDetectionProcessor(VideoProcessorPublisher, Warmable[RFDETR])
 
         self.events.send(
             DetectionCompletedEvent(
+                plugin_name=self.name,
                 objects=detected_objects,
                 raw_detections=detections,
                 image_width=img_width,
                 image_height=img_height,
+                inference_time_ms=inference_time_ms,
+                model_id=self._model_id,
             )
         )
         return None
